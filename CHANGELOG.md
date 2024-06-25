@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.10.2](https://github.com/glasskube/glasskube/compare/v0.10.1...v0.10.2) (2024-06-25)
+
+
+### Bug Fixes
+
+* **deps:** update module github.com/yuin/goldmark to v1.7.4 ([#868](https://github.com/glasskube/glasskube/issues/868)) ([d7ce5fa](https://github.com/glasskube/glasskube/commit/d7ce5fa72434e93720a9681279e8ad3e5e058cfe))
+
+
+### Docs
+
+* exchange static image with gif ([#862](https://github.com/glasskube/glasskube/issues/862)) ([946baf4](https://github.com/glasskube/glasskube/commit/946baf46f4872ed2b45188dfb378ed0f2df6cb24))
+* **website:** exchange repo mockup with actual screenshots ([#852](https://github.com/glasskube/glasskube/issues/852)) ([8adf8fb](https://github.com/glasskube/glasskube/commit/8adf8fb8e20f29e635eb9ce812338dd068f297bb))
+* **website:** glasskube is backed by Y Combinator ([#853](https://github.com/glasskube/glasskube/issues/853)) ([05e2ef7](https://github.com/glasskube/glasskube/commit/05e2ef7ce37af1ee31618dbb49258ab45d3a8a37))
+
 ## [0.10.1](https://github.com/glasskube/glasskube/compare/v0.10.0...v0.10.1) (2024-06-24)
 
 
