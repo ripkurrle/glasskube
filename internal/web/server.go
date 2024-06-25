@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/glasskube/glasskube/api/v1alpha1"
@@ -96,6 +97,7 @@ type server struct {
 	listener           net.Listener
 	restConfig         *rest.Config
 	rawConfig          *api.Config
+	nonCachedClient    client.PackageV1Alpha1Client
 	pkgClient          client.PackageV1Alpha1Client
 	repoClientset      repoclient.RepoClientset
 	k8sClient          *kubernetes.Clientset
@@ -904,7 +906,8 @@ func (server *server) initKubeConfig() ServerConfigError {
 
 	server.restConfig = restConfig
 	server.rawConfig = rawConfig
-	server.pkgClient = client // be aware that server.pkgClient is overridden with the cached client once bootstrap check succeeded
+	server.nonCachedClient = client // this should never be overridden
+	server.pkgClient = client       // be aware that server.pkgClient is overridden with the cached client once bootstrap check succeeded
 	return nil
 }
 
@@ -939,10 +942,80 @@ func (server *server) initCachedClient(ctx context.Context) {
 	packageStore, packageController := server.initPackageStoreAndController(ctx)
 	packageInfoStore, packageInfoController := server.initPackageInfoStoreAndController(ctx)
 	packageRepoStore, packageRepoController := server.initPackageRepoStoreAndController(ctx)
-	go packageController.Run(ctx.Done())
-	go packageInfoController.Run(ctx.Done())
-	go packageRepoController.Run(ctx.Done())
-	server.pkgClient = server.pkgClient.WithStores(packageStore, packageInfoStore, packageRepoStore)
+	server.pkgClient = server.nonCachedClient.WithStores(packageStore, packageInfoStore, packageRepoStore)
+
+	clpkgVerifier := newVerifier(server.restConfig, clusterPackageVerifyLister)
+	pkgInfoVerifier := newVerifier(server.restConfig, packageInfoVerifyLister)
+	pkgRepoVerifier := newVerifier(server.restConfig, packageRepoVerifyLister)
+	// controllers are stopped with their verifier's stop channel (which is closed on verification error)
+	go packageController.Run(clpkgVerifier.stopCh)
+	go packageInfoController.Run(pkgInfoVerifier.stopCh)
+	go packageRepoController.Run(pkgRepoVerifier.stopCh)
+
+	go server.broadcastUpdatesWhenInitiallySynced(packageController, packageInfoController, packageRepoController)
+
+	go func() {
+		for {
+			select {
+			case err := <-clpkgVerifier.errCh:
+				server.handleVerificationError(err)
+				packageStore, packageController = server.initPackageStoreAndController(ctx)
+				go packageController.Run(clpkgVerifier.newStopCh())
+				server.pkgClient = server.pkgClient.WithStores(packageStore, packageInfoStore, packageRepoStore)
+				go clpkgVerifier.start(ctx, server.pkgClient)
+
+			case err := <-pkgInfoVerifier.errCh:
+				server.handleVerificationError(err)
+				packageInfoStore, packageInfoController = server.initPackageInfoStoreAndController(ctx)
+				go packageInfoController.Run(pkgInfoVerifier.newStopCh())
+				server.pkgClient = server.pkgClient.WithStores(packageStore, packageInfoStore, packageRepoStore)
+				go pkgInfoVerifier.start(ctx, server.pkgClient)
+
+			case err := <-pkgRepoVerifier.errCh:
+				server.handleVerificationError(err)
+				packageRepoStore, packageRepoController = server.initPackageRepoStoreAndController(ctx)
+				go packageRepoController.Run(pkgRepoVerifier.newStopCh())
+				server.pkgClient = server.pkgClient.WithStores(packageStore, packageInfoStore, packageRepoStore)
+				go pkgRepoVerifier.start(ctx, server.pkgClient)
+			}
+			go server.broadcastUpdatesWhenInitiallySynced(packageController, packageInfoController, packageRepoController)
+		}
+	}()
+
+	go clpkgVerifier.start(ctx, server.pkgClient)
+	go pkgInfoVerifier.start(ctx, server.pkgClient)
+	go pkgRepoVerifier.start(ctx, server.pkgClient)
+}
+
+func (s *server) broadcastUpdatesWhenInitiallySynced(controllers ...cache.Controller) {
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if s.allControllersInitiallySynced(controllers...) {
+			s.sseHub.Broadcast <- &sse{
+				event: refreshPkgOverview,
+			}
+			break
+		}
+		<-tick.C
+	}
+}
+
+func (s *server) allControllersInitiallySynced(controllers ...cache.Controller) bool {
+	for _, c := range controllers {
+		if !c.HasSynced() {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *server) handleVerificationError(err error) {
+	fmt.Fprintf(os.Stderr, "\n\nLocal cache is probably OUT OF SYNC: %v\n", err)
+	fmt.Fprintf(os.Stderr, "Cache store and controller will be restarted now! In two seconds, everything should work again.\n")
+	fmt.Fprintf(os.Stderr, "If you think the UI shows outdated state, please restart the server and report the issue here:\n")
+	fmt.Fprintf(os.Stderr, "https://github.com/glasskube/glasskube/issues\n\n\n")
+	telemetry.ReportCacheVerificationError(err)
 }
 
 func (s *server) enrichContext(h http.Handler) http.Handler {
@@ -995,7 +1068,8 @@ func defaultKubeconfigExists() bool {
 }
 
 func (s *server) initPackageStoreAndController(ctx context.Context) (cache.Store, cache.Controller) {
-	pkgClient := s.pkgClient
+	pkgClient := s.nonCachedClient
+
 	return cache.NewInformer(
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
@@ -1004,7 +1078,7 @@ func (s *server) initPackageStoreAndController(ctx context.Context) (cache.Store
 				return &pkgList, err
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-				return pkgClient.ClusterPackages().Watch(ctx, withDecreasedTimeout(options))
+				return pkgClient.ClusterPackages().Watch(ctx, options)
 			},
 		},
 		&v1alpha1.ClusterPackage{},
@@ -1031,7 +1105,7 @@ func (s *server) initPackageStoreAndController(ctx context.Context) (cache.Store
 
 func (s *server) broadcastRefreshTriggers(pkg *v1alpha1.ClusterPackage) {
 	s.sseHub.Broadcast <- &sse{
-		event: "refresh-pkg-overview",
+		event: refreshPkgOverview,
 	}
 	s.sseHub.Broadcast <- &sse{
 		event: fmt.Sprintf("refresh-pkg-detail-%s", pkg.Name),
@@ -1039,7 +1113,7 @@ func (s *server) broadcastRefreshTriggers(pkg *v1alpha1.ClusterPackage) {
 }
 
 func (s *server) initPackageInfoStoreAndController(ctx context.Context) (cache.Store, cache.Controller) {
-	pkgClient := s.pkgClient
+	pkgClient := s.nonCachedClient
 	return cache.NewInformer(
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
@@ -1048,7 +1122,7 @@ func (s *server) initPackageInfoStoreAndController(ctx context.Context) (cache.S
 				return &packageInfoList, err
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-				return pkgClient.PackageInfos().Watch(ctx, withDecreasedTimeout(options))
+				return pkgClient.PackageInfos().Watch(ctx, options)
 			},
 		},
 		&v1alpha1.PackageInfo{},
@@ -1058,7 +1132,7 @@ func (s *server) initPackageInfoStoreAndController(ctx context.Context) (cache.S
 }
 
 func (s *server) initPackageRepoStoreAndController(ctx context.Context) (cache.Store, cache.Controller) {
-	pkgClient := s.pkgClient
+	pkgClient := s.nonCachedClient
 	return cache.NewInformer(
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
@@ -1067,22 +1141,13 @@ func (s *server) initPackageRepoStoreAndController(ctx context.Context) (cache.S
 				return &repositoryList, err
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-				return pkgClient.PackageRepositories().Watch(ctx, withDecreasedTimeout(options))
+				return pkgClient.PackageRepositories().Watch(ctx, options)
 			},
 		},
 		&v1alpha1.PackageRepository{},
 		0,
 		cache.ResourceEventHandlerFuncs{}, // TODO we might also want to update here?
 	)
-}
-
-func withDecreasedTimeout(opts metav1.ListOptions) metav1.ListOptions {
-	if opts.TimeoutSeconds != nil {
-		// reuse the randomized timeout and divide by 10
-		t := *opts.TimeoutSeconds / 10
-		opts.TimeoutSeconds = &t
-	}
-	return opts
 }
 
 func (s *server) isUpdateAvailable(ctx context.Context, packages ...string) bool {
